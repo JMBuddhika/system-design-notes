@@ -1,252 +1,238 @@
-# Design Payment System - Distributed Transaction Processing
+# Design Google Search - Distributed Web Crawler and Indexer
 
 ## 1) Problem statement
 
-Design a distributed payment transaction processing system for high-volume online payments with strong correctness guarantees, high availability, and full auditability.
+Design a Google Search-style system that continuously crawls the public web, builds an inverted index, and serves low-latency search queries at scale.
 
-Scope:
+Goals:
 
-- payment authorization and capture orchestration
-- internal ledger posting (double-entry)
-- asynchronous settlement integration
-- idempotent API and callback handling
+- very high crawl throughput with politeness guarantees
+- fresh and high-quality index updates
+- low-latency, high-availability query serving
+- robust failure handling across distributed components
 
-Out of scope:
+Non-goals:
 
-- card network protocol internals
-- fraud model design details
-- accounting/reporting UI
-
----
-
-## 2) Core requirements
-
-### Functional
-
-- create payment intent
-- authorize payment
-- capture or void authorization
-- support async gateway callbacks/webhooks
-- maintain immutable double-entry ledger
-- idempotent retries for all mutating APIs
-- reconciliation with payment gateway and bank settlement files
-
-### Non-functional
-
-- exactly-once effects for ledger posting (or functionally equivalent guarantees)
-- p99 API latency acceptable for checkout path
-- zero balance drift in ledger invariants
-- high availability during partial failures
-- full traceability for audits and incident response
+- full ranking model details
+- ad marketplace systems
+- anti-abuse policy internals
 
 ---
 
-## 3) High-level architecture
+## 2) High-level architecture
 
-Components:
+Pipeline stages:
 
-1. **API Gateway**
-- auth, rate limiting, request validation
-2. **Payment Orchestrator**
-- state machine for payment lifecycle
-3. **Risk Service**
-- approve/decline/checkpoint decisions
-4. **Gateway Adapter**
-- provider-specific integration (PSPs/acquirers)
-5. **Ledger Service**
-- immutable double-entry posting
-6. **Outbox/Event Publisher**
-- durable event emission to Kafka
-7. **Reconciliation Service**
-- compares internal records with external settlement files
-8. **Cache + Idempotency Store**
-- request dedupe and fast read path (e.g., Redis)
-9. **Observability Stack**
-- metrics, logs, traces, alerts
+1. **URL Discovery + Frontier**
+2. **Distributed Crawler Workers**
+3. **Content Processing + Dedup**
+4. **Index Builder (segment creation + merge)**
+5. **Query Serving Tier**
+6. **Ranking / Retrieval Features**
+7. **Monitoring + Reprocessing Control Plane**
+
+Data transport:
+
+- Kafka-like event streams between stages
+- object storage for raw/processed documents
+- distributed key-value store for URL/doc metadata
 
 ---
 
-## 4) Data model and invariants
+## 3) URL frontier and scheduling
 
-### Payment entity (stateful)
+Frontier requirements:
 
-Key fields:
+- prioritize important/fresh pages
+- enforce per-host politeness (crawl-delay, robots rules)
+- prevent duplicate URL explosion
+- support billions of queued URLs
 
-- `payment_id`
-- `merchant_id`
-- `amount`, `currency`
-- `status`: `INITIATED -> AUTHORIZED -> CAPTURED/FAILED/VOIDED -> SETTLED`
-- `idempotency_key`
-- `gateway_reference`
-- `version` (optimistic concurrency)
+Design:
 
-### Ledger entries (immutable)
+- normalize URL (canonicalization)
+- hash host to scheduler shard (consistent hashing)
+- maintain per-host token bucket for rate limits
+- use priority queue score:
+- recrawl urgency
+- page importance
+- historical change frequency
+- host reliability
 
-Fields:
-
-- `entry_id`, `tx_id`, `account_id`
-- `direction` (debit/credit)
-- `amount`, `currency`
-- `created_at`
-
-Invariant:
-
-- sum(debits) == sum(credits) for every ledger transaction
-
-Never update posted entries in place; correct with compensating entries.
+Why host-based sharding:
+- keeps politeness/accounting local to shard
+- reduces cross-shard coordination
 
 ---
 
-## 5) API design and idempotency
+## 4) Crawler worker design
 
-Mutating APIs require `Idempotency-Key` header:
+Worker loop:
 
-- `POST /payments`
-- `POST /payments/{id}/authorize`
-- `POST /payments/{id}/capture`
-- `POST /payments/{id}/void`
+1. pull URL task from shard queue
+2. check robots.txt cache + host rate limiter
+3. fetch page with timeout/retry policy
+4. record HTTP metadata and content hash
+5. emit raw document + extracted links to processing stream
 
-Idempotency behavior:
+Failure handling:
 
-- first successful request stores response fingerprint by `(merchant_id, idempotency_key, operation)`
-- retries return same logical result
-- conflicting payload with same key returns `409 Conflict`
-
-This prevents duplicate charges under retries/timeouts.
-
----
-
-## 6) Distributed consistency strategy
-
-Do not use distributed 2PC across all services (too fragile/slow at scale).
-
-Use:
-
-- local ACID transaction per service boundary
-- **Transactional Outbox** to publish events reliably
-- **Inbox dedupe** at consumers for exactly-once-ish processing
-- **Saga orchestration** for multi-step workflows with compensations
-
-Example:
-- if capture succeeds at gateway but ledger posting fails, enqueue recovery action and retry ledger post with idempotent tx id.
+- transient fetch errors -> exponential backoff retry
+- permanent errors (4xx) -> long backoff or tombstone
+- shard worker failure -> task lease expiry and reassignment
 
 ---
 
-## 7) Payment lifecycle (happy path)
+## 5) Deduplication strategy
 
-1. client calls create payment intent (`INITIATED`)
-2. orchestrator performs risk check
-3. adapter requests authorization from gateway
-4. on success, mark `AUTHORIZED`
-5. capture request triggers gateway capture
-6. ledger posts debit/credit entries (atomic in ledger DB)
-7. outbox emits `payment_captured` event to Kafka
-8. async settlement later marks `SETTLED`
+Need to reduce duplicate/near-duplicate pages.
 
----
+Approach:
 
-## 8) Failure modes and handling
+- exact dedup with content hash (e.g., SHA-256)
+- near-dup detection with shingling + SimHash/MinHash
+- canonical URL and rel=canonical signals integrated into doc identity
 
-### Gateway timeout after request sent
+Store:
 
-- status unknown; mark as `PENDING_GATEWAY_CONFIRMATION`
-- reconcile via webhook/polling
-- idempotency key ensures safe retries
+- doc fingerprint index with TTL/compaction
+- duplicate clusters map to canonical doc id
 
-### Duplicate webhook/callback
-
-- dedupe by `(gateway_event_id, provider)`
-- process at-least-once delivery safely with inbox table
-
-### Partial commit risk
-
-- write state change + outbox event in same DB transaction
-- publisher reads outbox and retries until acked
-
-### Concurrent capture attempts
-
-- optimistic locking on payment row (`version`)
-- one succeeds, others return conflict/no-op idempotent response
-
-### Ledger service unavailable
-
-- keep orchestrator state durable
-- retry posting with backoff
-- block settlement finalization until ledger consistency confirmed
+Tradeoff:
+- stricter dedup lowers index size and noise
+- over-aggressive dedup can hide meaningful variants
 
 ---
 
-## 9) Partitioning and scaling
+## 6) Indexing pipeline
 
-Partition keys:
+Processing steps:
 
-- write path: `merchant_id` (good tenant isolation)
-- high-cardinality read path: `payment_id`
+1. parse HTML, extract title/body/anchors/metadata
+2. language detection and tokenization
+3. normalization/stemming (language-specific)
+4. build postings lists per term
+5. write immutable index segments
+6. background merge segments (LSM-style compaction behavior)
 
-Kafka topics:
+Index partitions:
 
-- `payment-events` partitioned by `payment_id` for per-payment ordering
-- `ledger-events` partitioned by `tx_id`
+- shard by term range/hash for parallel query fanout
+- replicate shards for availability and read scaling
 
-Use consistent hashing for cache and idempotency store shards to minimize remap churn during scaling.
+Freshness model:
 
----
-
-## 10) Reconciliation and correctness controls
-
-Daily/near-real-time reconciliation:
-
-- compare gateway captures/refunds vs internal payment states
-- compare settlement files vs internal ledger aggregates
-- create discrepancy tickets + automatic retry jobs
-
-Control metrics:
-
-- unmatched transaction count
-- reconciliation lag
-- ledger imbalance incidents (must be zero)
-- duplicate callback drop rate
+- near-real-time mini-segments for fresh docs
+- periodic major merges for efficient long-term retrieval
 
 ---
 
-## 11) Observability and SLOs
+## 7) Query serving path
 
-Track:
+Query flow:
 
-- auth success rate, capture success rate
-- p95/p99 latency by operation
-- retry counts and timeout rates
-- idempotency hit ratio
-- outbox backlog depth
-- webhook processing lag
-- reconciliation mismatch rate
+1. API receives query
+2. query understanding: spell correction, rewriting, intent hints
+3. retrieve candidate docs from index shards
+4. rank candidates with scoring model/features
+5. apply quality/safety filters
+6. return top-K results with snippets
 
-Critical alerts:
+Latency techniques:
 
-- non-zero ledger imbalance
-- sustained outbox lag
-- spike in duplicate charge prevention triggers
-- gateway timeout surge by provider
+- cache hot query results (Redis-like cache)
+- cache term dictionary and top postings in memory
+- early termination and dynamic pruning in ranking
 
----
+Target:
 
-## 12) Security and compliance notes
-
-- encrypt sensitive payloads at rest and in transit
-- tokenize PAN-equivalent payment data (do not store raw card details)
-- strict audit log for all state transitions
-- role-based access controls on refund/manual override operations
+- p95 query latency < 200 ms (region dependent)
 
 ---
 
-## 13) Practical design choices (what I would do)
+## 8) Consistency and freshness tradeoffs
 
-For Grab-like scale and reliability:
+Crawler/indexing is naturally asynchronous, so system is eventually consistent.
 
-- idempotent APIs everywhere on mutating paths
-- outbox + inbox dedupe instead of global 2PC
-- immutable ledger with compensating entries only
-- Kafka for async state propagation, Redis for idempotency/cache
-- strong reconciliation pipeline as non-negotiable safety net
+Key tradeoffs:
 
-This gives high throughput with operationally realistic exactly-once effects where it matters: user-visible money movement and ledger correctness.
+- aggressive recrawl improves freshness but increases cost
+- larger batches improve throughput but delay updates
+- frequent merges improve query speed but consume IO/CPU
+
+Practical policy:
+
+- tier pages by importance/change-rate
+- allocate crawl budget dynamically
+- keep fast lane for highly dynamic critical domains
+
+---
+
+## 9) Reliability and failure recovery
+
+Core reliability patterns:
+
+- at-least-once stage delivery via queue + idempotent consumers
+- checkpointed offsets per stage
+- immutable segment files for safe replay/rebuild
+- dead-letter queues for malformed/unparseable docs
+
+Disaster recovery:
+
+- multi-region replicated metadata
+- periodic snapshot of frontier and index manifests
+- replay from durable event log to rebuild derived artifacts
+
+---
+
+## 10) Observability and SLOs
+
+Metrics by stage:
+
+Crawler:
+- fetch success rate
+- robots-blocked ratio
+- median/p95 fetch latency
+- per-host error rates
+
+Indexer:
+- docs processed/sec
+- dedup ratio
+- segment merge backlog
+- index freshness lag
+
+Serving:
+- p50/p95/p99 query latency
+- cache hit rate
+- shard fanout failures
+- result quality proxies (CTR/dwell proxies if available)
+
+Alert examples:
+
+- crawl backlog growth + stale frontier
+- index freshness lag breach
+- rising shard timeout rates on query fanout
+
+---
+
+## 11) Security and compliance considerations
+
+- strict robots.txt adherence and user-agent identification
+- abuse controls and crawl-budget throttles
+- content storage access controls and encryption at rest
+- legal takedown/de-index workflows with audit trail
+
+---
+
+## 12) What I would choose in production
+
+For a Grab-scale engineering context:
+
+- Kafka-backed multi-stage ingestion with idempotent consumers
+- host-sharded frontier with token-bucket politeness
+- consistent hashing for scheduler shard balancing
+- immutable index segments + continuous merge pipeline
+- Redis-style caches for hot query/metadata acceleration
+- explicit freshness SLOs tied to domain-level crawl budgets
+
+This design prioritizes operational stability, scalable throughput, and low-latency retrieval while preserving clear failure recovery semantics.
