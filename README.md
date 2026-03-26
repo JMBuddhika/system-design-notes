@@ -1,238 +1,249 @@
-# Design Google Search - Distributed Web Crawler and Indexer
+# Design Dropbox - Distributed Cloud Storage
 
 ## 1) Problem statement
 
-Design a Google Search-style system that continuously crawls the public web, builds an inverted index, and serves low-latency search queries at scale.
+Design a Dropbox-like cloud storage system that supports:
 
-Goals:
+- reliable file upload/download across devices
+- near real-time synchronization
+- version history and conflict handling
+- scalable storage for billions of objects
 
-- very high crawl throughput with politeness guarantees
-- fresh and high-quality index updates
-- low-latency, high-availability query serving
-- robust failure handling across distributed components
-
-Non-goals:
-
-- full ranking model details
-- ad marketplace systems
-- anti-abuse policy internals
+Focus: distributed systems tradeoffs (consistency, durability, availability, and operational recovery), not UI.
 
 ---
 
-## 2) High-level architecture
+## 2) Core requirements
 
-Pipeline stages:
+### Functional
 
-1. **URL Discovery + Frontier**
-2. **Distributed Crawler Workers**
-3. **Content Processing + Dedup**
-4. **Index Builder (segment creation + merge)**
-5. **Query Serving Tier**
-6. **Ranking / Retrieval Features**
-7. **Monitoring + Reprocessing Control Plane**
+- upload/download files and folders
+- sync changes across devices
+- deduplicate file chunks globally
+- support file versioning and restore
+- handle concurrent edits with deterministic conflict behavior
+- share links with access control (basic)
 
-Data transport:
+### Non-functional
 
-- Kafka-like event streams between stages
-- object storage for raw/processed documents
-- distributed key-value store for URL/doc metadata
-
----
-
-## 3) URL frontier and scheduling
-
-Frontier requirements:
-
-- prioritize important/fresh pages
-- enforce per-host politeness (crawl-delay, robots rules)
-- prevent duplicate URL explosion
-- support billions of queued URLs
-
-Design:
-
-- normalize URL (canonicalization)
-- hash host to scheduler shard (consistent hashing)
-- maintain per-host token bucket for rate limits
-- use priority queue score:
-- recrawl urgency
-- page importance
-- historical change frequency
-- host reliability
-
-Why host-based sharding:
-- keeps politeness/accounting local to shard
-- reduces cross-shard coordination
+- high durability (11+ nines object durability target style)
+- high availability for metadata and object reads
+- low-latency metadata ops (list, stat, changed-files feed)
+- efficient bandwidth usage (chunking + delta sync)
+- auditable operations and strong observability
 
 ---
 
-## 4) Crawler worker design
+## 3) High-level architecture
 
-Worker loop:
+Main components:
 
-1. pull URL task from shard queue
-2. check robots.txt cache + host rate limiter
-3. fetch page with timeout/retry policy
-4. record HTTP metadata and content hash
-5. emit raw document + extracted links to processing stream
+1. **API Gateway**
+- auth, rate limits, request validation
+2. **Metadata Service**
+- namespace tree, file versions, chunk manifests, sync cursors
+3. **Chunk Store Service**
+- stores encrypted chunks in object storage backend
+4. **Upload Coordinator**
+- creates upload sessions, validates checksums, finalizes commit
+5. **Sync Service**
+- change feed per user/workspace for cross-device sync
+6. **Conflict Resolver**
+- version checks and conflict file generation
+7. **Background Workers**
+- compaction, garbage collection, replication repair, reindexing
 
-Failure handling:
+Data split:
 
-- transient fetch errors -> exponential backoff retry
-- permanent errors (4xx) -> long backoff or tombstone
-- shard worker failure -> task lease expiry and reassignment
-
----
-
-## 5) Deduplication strategy
-
-Need to reduce duplicate/near-duplicate pages.
-
-Approach:
-
-- exact dedup with content hash (e.g., SHA-256)
-- near-dup detection with shingling + SimHash/MinHash
-- canonical URL and rel=canonical signals integrated into doc identity
-
-Store:
-
-- doc fingerprint index with TTL/compaction
-- duplicate clusters map to canonical doc id
-
-Tradeoff:
-- stricter dedup lowers index size and noise
-- over-aggressive dedup can hide meaningful variants
+- **metadata** in strongly consistent DB (critical correctness path)
+- **blob chunks** in replicated object storage (large immutable payload path)
 
 ---
 
-## 6) Indexing pipeline
+## 4) Data model
 
-Processing steps:
+### Metadata entities
 
-1. parse HTML, extract title/body/anchors/metadata
-2. language detection and tokenization
-3. normalization/stemming (language-specific)
-4. build postings lists per term
-5. write immutable index segments
-6. background merge segments (LSM-style compaction behavior)
+- `FileEntry(file_id, path, owner_id, current_version, deleted_flag, updated_at)`
+- `FileVersion(version_id, file_id, parent_version, created_by, created_at)`
+- `ChunkManifest(version_id, ordered_chunk_ids, total_size, file_hash)`
+- `ChunkRef(chunk_id, content_hash, size, ref_count, storage_locations[])`
+- `SyncCursor(user_id, device_id, last_event_id)`
 
-Index partitions:
+### Invariants
 
-- shard by term range/hash for parallel query fanout
-- replicate shards for availability and read scaling
-
-Freshness model:
-
-- near-real-time mini-segments for fresh docs
-- periodic major merges for efficient long-term retrieval
+- each committed file version references immutable chunk IDs
+- manifest checksum must match reconstructed file checksum
+- metadata commit is atomic for version+manifest publication
+- chunk `ref_count` matches live manifest references (eventually repaired if drift)
 
 ---
 
-## 7) Query serving path
+## 5) Upload flow (chunked + dedup)
 
-Query flow:
+1. client requests upload session
+2. client splits file into fixed/rolling chunks and computes hashes
+3. server checks which chunk hashes already exist (dedup lookup)
+4. client uploads only missing chunks (parallel multi-part)
+5. server verifies per-chunk checksum and stores chunk
+6. client submits finalize request with ordered manifest
+7. metadata transaction commits new file version atomically
+8. sync event emitted for subscribed devices
 
-1. API receives query
-2. query understanding: spell correction, rewriting, intent hints
-3. retrieve candidate docs from index shards
-4. rank candidates with scoring model/features
-5. apply quality/safety filters
-6. return top-K results with snippets
+Benefits:
 
-Latency techniques:
-
-- cache hot query results (Redis-like cache)
-- cache term dictionary and top postings in memory
-- early termination and dynamic pruning in ranking
-
-Target:
-
-- p95 query latency < 200 ms (region dependent)
+- reduced bandwidth and storage for repeated content
+- resilient resume for interrupted uploads
+- scalable parallel transfer
 
 ---
 
-## 8) Consistency and freshness tradeoffs
+## 6) Download and sync flow
 
-Crawler/indexing is naturally asynchronous, so system is eventually consistent.
+Download:
 
-Key tradeoffs:
+1. client fetches latest manifest from metadata service
+2. fetches chunks from nearest storage replicas/CDN
+3. verifies checksums and reconstructs file locally
 
-- aggressive recrawl improves freshness but increases cost
-- larger batches improve throughput but delay updates
-- frequent merges improve query speed but consume IO/CPU
+Sync:
 
-Practical policy:
-
-- tier pages by importance/change-rate
-- allocate crawl budget dynamically
-- keep fast lane for highly dynamic critical domains
+1. client polls/streams changes since `last_event_id`
+2. applies operations in event order
+3. resolves local divergence using version checks
+4. updates cursor on successful apply
 
 ---
 
-## 9) Reliability and failure recovery
+## 7) Consistency choices
 
-Core reliability patterns:
+### Metadata: strong consistency
 
-- at-least-once stage delivery via queue + idempotent consumers
-- checkpointed offsets per stage
-- immutable segment files for safe replay/rebuild
-- dead-letter queues for malformed/unparseable docs
+Use quorum-based replicated DB (or consensus-backed key/value) for:
+
+- file tree updates
+- version commits
+- rename/move/delete operations
+- conflict detection
+
+Rationale: user-visible correctness depends on metadata ordering.
+
+### Blob data: eventual consistency acceptable with validation
+
+Chunk writes can be asynchronously replicated as long as:
+
+- commit only references chunks acknowledged durable enough
+- checksum validation prevents serving corrupted chunks
+- repair jobs reconcile missing replicas
+
+---
+
+## 8) Conflict handling strategy
+
+Conflict scenario: two devices edit same base version offline.
+
+Policy:
+
+- optimistic concurrency with `expected_parent_version`
+- first successful commit advances head
+- later commit creates `filename (conflict from device X)` version
+- preserve both versions; do not silently overwrite
+
+For collaborative docs, this can evolve to CRDT/OT, but for binary files conflict-copy is pragmatic and predictable.
+
+---
+
+## 9) Replication, durability, and DR
+
+Chunk durability:
+
+- replicate chunks across multiple zones/regions
+- background anti-entropy scans repair missing/corrupt replicas
+- immutable chunk model simplifies integrity checks
+
+Metadata durability:
+
+- synchronous replication across quorum nodes
+- periodic snapshots + WAL archiving
+- tested restore drills with RPO/RTO targets
 
 Disaster recovery:
 
-- multi-region replicated metadata
-- periodic snapshot of frontier and index manifests
-- replay from durable event log to rebuild derived artifacts
+- promote warm standby region
+- replay metadata log and rehydrate caches
+- rebalance traffic via global load balancer
 
 ---
 
-## 10) Observability and SLOs
+## 10) Failure scenarios and handling
 
-Metrics by stage:
+1. **Partial upload succeeds for some chunks only**
+- keep upload session state with TTL
+- resume missing chunks; finalize only when manifest complete
 
-Crawler:
-- fetch success rate
-- robots-blocked ratio
-- median/p95 fetch latency
-- per-host error rates
+2. **Metadata commit succeeds but sync event publish fails**
+- transactional outbox pattern
+- retry publisher ensures eventual sync propagation
 
-Indexer:
-- docs processed/sec
-- dedup ratio
-- segment merge backlog
-- index freshness lag
+3. **Chunk store unavailable in one zone**
+- read from alternate replica/CDN
+- write path degrades with backpressure or reroute
 
-Serving:
-- p50/p95/p99 query latency
-- cache hit rate
-- shard fanout failures
-- result quality proxies (CTR/dwell proxies if available)
-
-Alert examples:
-
-- crawl backlog growth + stale frontier
-- index freshness lag breach
-- rising shard timeout rates on query fanout
+4. **Client retries finalize due to timeout**
+- idempotency key on finalize endpoint
+- return prior result if version already committed
 
 ---
 
-## 11) Security and compliance considerations
+## 11) Scaling strategy
 
-- strict robots.txt adherence and user-agent identification
-- abuse controls and crawl-budget throttles
-- content storage access controls and encryption at rest
-- legal takedown/de-index workflows with audit trail
+- shard metadata by `workspace_id/user_id` (hot-tenant aware)
+- cache hot metadata paths in Redis-like cache
+- consistent hashing for chunk index/cache layers
+- CDN for download acceleration
+- adaptive chunk size to balance dedup gain vs metadata overhead
 
 ---
 
-## 12) What I would choose in production
+## 12) Observability and SLOs
 
-For a Grab-scale engineering context:
+Key metrics:
 
-- Kafka-backed multi-stage ingestion with idempotent consumers
-- host-sharded frontier with token-bucket politeness
-- consistent hashing for scheduler shard balancing
-- immutable index segments + continuous merge pipeline
-- Redis-style caches for hot query/metadata acceleration
-- explicit freshness SLOs tied to domain-level crawl budgets
+- upload success rate, p95 finalize latency
+- metadata read/write latency by endpoint
+- sync lag (event creation -> device apply)
+- chunk dedup ratio
+- checksum mismatch/corruption incidents
+- replication repair backlog
+- conflict rate by client version
 
-This design prioritizes operational stability, scalable throughput, and low-latency retrieval while preserving clear failure recovery semantics.
+Alerts:
+
+- metadata quorum health degradation
+- sustained sync lag breach
+- spike in failed finalize or checksum mismatches
+- repair backlog growth
+
+---
+
+## 13) Security and compliance
+
+- TLS everywhere; encryption at rest for metadata/chunks
+- per-tenant access controls and signed download URLs
+- optional client-side encryption key model for higher privacy
+- immutable audit logs for critical operations (share/delete/restore)
+
+---
+
+## 14) What I would choose in production
+
+For a Grab-scale ML/MLOps-adjacent platform (datasets, model artifacts, feature snapshots):
+
+- strongly consistent metadata plane
+- immutable chunk store with multi-zone replication
+- chunk-level dedup + resumable upload sessions
+- transactional outbox for sync events
+- explicit conflict-copy semantics for binaries
+- aggressive observability on sync lag and durability repair
+
+This gives a practical balance of user-visible correctness, bandwidth efficiency, and distributed fault tolerance.
